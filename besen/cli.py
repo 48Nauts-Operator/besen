@@ -8,6 +8,9 @@ Commands:
     move   — Move files to NAS (/Volumes/Tron) via rsync
     sweep  — Quick one-shot: scan + offer to clean top items
     cpu    — CPU usage, top processes, zombies, stale procs
+    watch  — Single headless run (used by daemon)
+    daemon — Install/uninstall/status of background scheduler
+    notify — Send a test notification
 """
 
 from __future__ import annotations
@@ -736,3 +739,202 @@ def cpu(
             console.print(f"\n[green]No stale user processes (>{stale_hours:.0f}h idle).[/green]")
     else:
         console.print(f"\n[green]No stale processes (>{stale_hours:.0f}h idle).[/green]")
+
+
+# ── watch (headless single run for daemon) ────────────────────────────
+
+
+@app.command()
+def watch(
+    quiet: bool = typer.Option(True, "--quiet/--verbose", "-q/-V", help="Suppress output (for daemon use)."),
+) -> None:
+    """Single headless run — apply all auto-policies.
+
+    This is what the daemon calls on schedule. It checks disk space,
+    kills zombies, monitors CPU/memory, and sends notifications.
+    """
+    import json
+    from datetime import datetime
+
+    from besen.policies import (
+        apply_cpu_policy,
+        apply_disk_policy,
+        apply_zombie_policy,
+        load_policies,
+    )
+
+    policies = load_policies()
+    timestamp = datetime.now().isoformat(timespec="seconds")
+
+    results = {
+        "timestamp": timestamp,
+        "disk": apply_disk_policy(policies),
+        "zombie": apply_zombie_policy(policies),
+        "cpu": apply_cpu_policy(policies),
+    }
+
+    if not quiet:
+        console.print(Panel(
+            json.dumps(results, indent=2, default=str),
+            title=f"[bold]Watch Run — {timestamp}[/bold]",
+        ))
+    else:
+        # Minimal log output for daemon mode
+        parts = []
+        d = results["disk"]
+        if d.get("cleaned"):
+            parts.append(f"cleaned {naturalsize(d['freed_bytes'], binary=True)}")
+        if d.get("notified"):
+            parts.append("disk-low")
+        z = results["zombie"]
+        if z.get("killed"):
+            parts.append(f"killed {z['killed']} zombies")
+        c = results["cpu"]
+        if c.get("memory_alert"):
+            parts.append("mem-pressure")
+        if c.get("high_cpu_procs"):
+            parts.append(f"high-cpu: {', '.join(c['high_cpu_procs'][:3])}")
+
+        summary = ", ".join(parts) if parts else "all clear"
+        print(f"[{timestamp}] {summary}")
+
+
+# ── daemon ────────────────────────────────────────────────────────────
+
+
+daemon_app = typer.Typer(
+    name="daemon",
+    help="Background scheduler management.",
+    no_args_is_help=True,
+)
+app.add_typer(daemon_app, name="daemon")
+
+
+@daemon_app.command()
+def install(
+    interval: int = typer.Option(60, "--interval", "-i", help="Run interval in minutes."),
+) -> None:
+    """Install the background daemon (launchd)."""
+    from besen.daemon import install as do_install
+    from besen.policies import CONFIG_PATH, load_policies, save_policies
+
+    # Ensure policies config exists with defaults
+    if not CONFIG_PATH.exists():
+        save_policies(load_policies())
+        console.print(f"[dim]Created default policies: {CONFIG_PATH}[/dim]")
+
+    try:
+        msg = do_install(interval_minutes=interval)
+        console.print(f"[bold green]Daemon installed.[/bold green]\n\n{msg}")
+    except FileNotFoundError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1)
+
+
+@daemon_app.command()
+def uninstall() -> None:
+    """Uninstall the background daemon."""
+    from besen.daemon import uninstall as do_uninstall
+
+    msg = do_uninstall()
+    console.print(msg)
+
+
+@daemon_app.command(name="status")
+def daemon_status() -> None:
+    """Show daemon status and recent logs."""
+    from besen.daemon import read_logs
+    from besen.daemon import status as get_status
+
+    info = get_status()
+
+    if not info["installed"]:
+        console.print("[yellow]Daemon not installed.[/yellow]")
+        console.print("[dim]Run: besen daemon install[/dim]")
+        return
+
+    state = "[green]running[/green]" if info["running"] else "[red]stopped[/red]"
+    console.print(Panel(
+        f"  Status:   {state}\n"
+        f"  Interval: every {info['interval_min']} min\n"
+        f"  Plist:    {info['plist_path']}\n"
+        f"  Log:      {info['log_path']}",
+        title="[bold]Besen Daemon[/bold]",
+    ))
+
+    # Show recent log
+    logs = read_logs(10)
+    if logs:
+        console.print(f"\n[bold]Recent activity:[/bold]\n{logs}")
+
+
+@daemon_app.command()
+def logs(
+    lines: int = typer.Option(30, "--lines", "-n", help="Number of log lines to show."),
+    follow: bool = typer.Option(False, "--follow", "-f", help="Follow log output (tail -f)."),
+) -> None:
+    """Show daemon logs."""
+    from besen.daemon import LOG_OUT, read_logs
+
+    if follow:
+        import subprocess
+        if not LOG_OUT.exists():
+            console.print("[yellow]No log file yet — daemon hasn't run.[/yellow]")
+            raise typer.Exit()
+        console.print(f"[dim]Following {LOG_OUT} (Ctrl+C to stop)...[/dim]\n")
+        try:
+            subprocess.run(["tail", "-f", str(LOG_OUT)])
+        except KeyboardInterrupt:
+            pass
+    else:
+        console.print(read_logs(lines))
+
+
+# ── policies ──────────────────────────────────────────────────────────
+
+
+@app.command()
+def policies() -> None:
+    """Show and edit auto-policies configuration."""
+    from besen.policies import CONFIG_PATH, load_policies, save_policies
+
+    p = load_policies()
+
+    console.print(Panel(
+        f"  [bold]Disk Policy[/bold]\n"
+        f"    Enabled:          {'yes' if p.disk.enabled else 'no'}\n"
+        f"    Auto-clean below: {p.disk.free_threshold_gb:.0f} GB free\n"
+        f"    Notify below:     {p.disk.notify_threshold_gb:.0f} GB free\n"
+        f"    Safe targets only: {'yes' if p.disk.safe_only else 'no'}\n\n"
+        f"  [bold]Zombie Policy[/bold]\n"
+        f"    Enabled:          {'yes' if p.zombie.enabled else 'no'}\n"
+        f"    Auto-kill after:  {p.zombie.min_age_hours:.0f}h\n"
+        f"    Notify:           {'yes' if p.zombie.notify else 'no'}\n\n"
+        f"  [bold]CPU Policy[/bold]\n"
+        f"    Enabled:          {'yes' if p.cpu.enabled else 'no'}\n"
+        f"    High CPU alert:   >{p.cpu.high_cpu_threshold:.0f}% for {p.cpu.sustained_minutes}min\n"
+        f"    Memory alert:     >{p.cpu.memory_threshold:.0f}%\n"
+        f"    Auto-kill stale:  {f'{p.cpu.auto_kill_stale_hours:.0f}h' if p.cpu.auto_kill_stale_hours else 'disabled'}",
+        title="[bold]Auto-Policies[/bold]",
+    ))
+
+    console.print(f"\n[dim]Config: {CONFIG_PATH}[/dim]")
+    console.print("[dim]Edit the JSON file directly or use env vars to override.[/dim]")
+
+
+# ── notify ────────────────────────────────────────────────────────────
+
+
+@app.command()
+def notify(
+    message: str = typer.Argument("Besen is working.", help="Notification message."),
+    title: str = typer.Option("Test", "--title", "-t", help="Notification title."),
+) -> None:
+    """Send a test macOS notification."""
+    from besen.notifier import notify as send_notify
+
+    success = send_notify(title=title, message=message)
+    if success:
+        console.print("[green]Notification sent.[/green]")
+    else:
+        console.print("[red]Failed to send notification.[/red]")
