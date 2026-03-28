@@ -49,6 +49,10 @@ besen scan --sort category
 | `besen move` | Move files to NAS via rsync with verification |
 | `besen sweep` | Quick one-shot: scan + offer to clean the biggest safe items |
 | `besen cpu` | System health: CPU/memory overview, top processes, zombie detection, stale process finder |
+| `besen watch` | Single headless run — apply all auto-policies (used by daemon) |
+| `besen daemon` | Install/uninstall/status of background scheduler (launchd) |
+| `besen policies` | Show auto-policy configuration (disk, zombie, CPU thresholds) |
+| `besen notify` | Send a test macOS notification |
 
 ---
 
@@ -201,28 +205,98 @@ Protected directories (never touched by clean):
 
 ---
 
-## Roadmap
+## Daemon & Auto-Policies
 
-### Daemon Mode (next)
-- Background scheduler via `launchd` plist or cron
-- Configurable intervals (hourly, daily, weekly)
-- Auto-clean safe targets on schedule
-- Disk pressure detection — trigger cleanup when free space drops below threshold
+Besen includes a background daemon that monitors your system automatically.
+
+### Setup
+
+```bash
+# Install daemon (runs every 60 minutes via launchd)
+besen daemon install --interval 60
+
+# Check status
+besen daemon status
+
+# View logs
+besen daemon logs -f          # follow mode (tail -f)
+besen daemon logs -n 50       # last 50 lines
+
+# Uninstall
+besen daemon uninstall
+```
+
+### Policies
+
+Policies control what the daemon does on each run. Stored in `~/.config/besen/policies.json`:
+
+```bash
+besen policies                # View current policies
+```
+
+```json
+{
+  "disk": {
+    "enabled": true,
+    "free_threshold_gb": 50.0,     // Auto-clean when below this
+    "notify_threshold_gb": 100.0,  // Notify when below this
+    "safe_only": true              // Only clean safe targets
+  },
+  "zombie": {
+    "enabled": true,
+    "min_age_hours": 1.0,          // Auto-kill zombies older than this
+    "notify": true
+  },
+  "cpu": {
+    "enabled": true,
+    "high_cpu_threshold": 200.0,   // Alert above this %
+    "sustained_minutes": 10,
+    "memory_threshold": 90.0,      // Alert above this %
+    "auto_kill_stale_hours": 0     // 0 = disabled (opt-in)
+  }
+}
+```
 
 ### Notifications
-- macOS native notifications via `osascript` / `terminal-notifier`
-- Alerts for: disk space low, CPU sustained high, memory pressure, new zombie processes
-- Configurable thresholds and cooldown periods
 
-### Auto-Kill Policies
-- Define rules for automatic zombie cleanup
-- Stale process policies (e.g., kill Node processes idle >48h)
-- Watchdog for runaway processes (CPU >200% for >10 minutes)
+Native macOS notification center alerts — no extra dependencies:
 
-### Reporting
+```bash
+besen notify "Hello from Besen"    # Test notification
+```
+
+The daemon sends notifications for:
+- Disk space below threshold
+- Zombie processes detected and killed
+- Sustained high CPU usage
+- Memory pressure
+- Auto-cleanup completion with freed space
+
+### Manual Watch Run
+
+```bash
+besen watch --verbose    # Run policies once, show results
+besen watch              # Quiet mode (daemon uses this)
+```
+
+---
+
+## Roadmap
+
+### Reporting (next)
 - Weekly summary: space cleaned, zombies killed, top consumers
 - Trend tracking: disk usage over time
 - Export to JSON for dashboarding
+
+### Enhanced Policies
+- Per-process kill rules (e.g., "kill Node processes idle >48h")
+- Cooldown periods between notifications
+- Notification channels (Slack, webhook)
+
+### Smarter Scanning
+- node_modules discovery across all projects
+- Git repo cleanup (stale branches, large objects)
+- Time Machine snapshot management
 
 ---
 
@@ -231,12 +305,15 @@ Protected directories (never touched by clean):
 ```
 besen/
 ├── __init__.py     # Package version
-├── cli.py          # Typer CLI with 7 commands
+├── cli.py          # Typer CLI with 11 commands
 ├── config.py       # pydantic-settings (BESEN_ env prefix)
 ├── scanner.py      # 44 scan targets + disk usage + large file finder
 ├── cleaner.py      # Safe cleanup with confirmation
 ├── mover.py        # NAS move via rsync with verification
-└── procs.py        # CPU/memory monitoring, zombie/stale detection
+├── procs.py        # CPU/memory monitoring, zombie/stale detection
+├── notifier.py     # macOS native notifications via osascript
+├── policies.py     # Auto-policy rules and execution engine
+└── daemon.py       # launchd plist management (install/uninstall/status)
 ```
 
 ---
