@@ -11,6 +11,7 @@ Commands:
     watch  — Single headless run (used by daemon)
     daemon — Install/uninstall/status of background scheduler
     notify — Send a test notification
+    report — Cleanup history: day/week/month/year stats
 """
 
 from __future__ import annotations
@@ -388,7 +389,7 @@ def clean(
             raise typer.Exit()
 
     console.print()
-    freed = clean_targets(selected)
+    freed = clean_targets(selected, source="manual")
     console.print(
         f"\n[bold green]Done![/bold green] Freed "
         f"[bold]{naturalsize(freed, binary=True)}[/bold]"
@@ -498,7 +499,7 @@ def sweep(
             console.print(
                 f"[bold]Auto-cleaning {len(safe_targets)} safe targets...[/bold]"
             )
-            freed = clean_targets(safe_targets)
+            freed = clean_targets(safe_targets, source="sweep")
             console.print(
                 f"\n[bold green]Swept![/bold green] Freed "
                 f"[bold]{naturalsize(freed, binary=True)}[/bold]"
@@ -508,7 +509,7 @@ def sweep(
     else:
         if typer.confirm("Clean all safe targets?", default=False):
             safe_targets = [t for t in top_targets if t.safe_to_clean]
-            freed = clean_targets(safe_targets)
+            freed = clean_targets(safe_targets, source="sweep")
             console.print(
                 f"\n[bold green]Swept![/bold green] Freed "
                 f"[bold]{naturalsize(freed, binary=True)}[/bold]"
@@ -938,3 +939,160 @@ def notify(
         console.print("[green]Notification sent.[/green]")
     else:
         console.print("[red]Failed to send notification.[/red]")
+
+
+# ── report ────────────────────────────────────────────────────────────
+
+
+@app.command()
+def report(
+    period: str = typer.Option(
+        "all", "--period", "-p",
+        help="Time period: today, week, month, year, all.",
+    ),
+    detail: bool = typer.Option(
+        False, "--detail", "-d",
+        help="Show per-target breakdown.",
+    ),
+) -> None:
+    """Show cleanup history — how much data was cleaned over time."""
+    from datetime import datetime, timedelta
+
+    from besen.history import HISTORY_PATH, load_history, summarize, summarize_by_period
+
+    # Determine time filter
+    now = datetime.now()
+    since = None
+    period_label = "All Time"
+    if period == "today":
+        since = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        period_label = "Today"
+    elif period == "week":
+        since = now - timedelta(days=7)
+        period_label = "Last 7 Days"
+    elif period == "month":
+        since = now - timedelta(days=30)
+        period_label = "Last 30 Days"
+    elif period == "year":
+        since = now - timedelta(days=365)
+        period_label = "Last 365 Days"
+
+    events = load_history(since=since)
+
+    if not events:
+        console.print("[yellow]No cleanup history yet.[/yellow]")
+        console.print("[dim]History is recorded when you run: besen clean, sweep, or the daemon.[/dim]")
+        raise typer.Exit()
+
+    # ── Summary panel ──
+    s = summarize(events)
+    console.print(Panel(
+        f"  Total freed:   [bold green]{naturalsize(s['total_freed'], binary=True)}[/bold green]\n"
+        f"  Clean events:  {s['event_count']}\n"
+        f"  Period:        {period_label}",
+        title="[bold]Cleanup Report[/bold]",
+    ))
+
+    # ── By source ──
+    if s["by_source"]:
+        src_table = Table(title="By Source", show_lines=False)
+        src_table.add_column("Source", style="bold")
+        src_table.add_column("Freed", justify="right", style="green")
+        src_table.add_column("Events", justify="right", style="dim")
+
+        for source, freed in s["by_source"].items():
+            count = sum(1 for e in events if e.get("source") == source)
+            src_table.add_row(source, naturalsize(freed, binary=True), str(count))
+        console.print(src_table)
+
+    # ── By category ──
+    if s["by_category"]:
+        cat_table = Table(title="By Category", show_lines=False)
+        cat_table.add_column("Category", style="cyan")
+        cat_table.add_column("Freed", justify="right", style="green")
+
+        for cat, freed in s["by_category"].items():
+            cat_table.add_row(cat, naturalsize(freed, binary=True))
+        console.print(cat_table)
+
+    # ── Per-target detail ──
+    if detail and s["by_target"]:
+        tgt_table = Table(title="By Target", show_lines=False)
+        tgt_table.add_column("Target", style="bold")
+        tgt_table.add_column("Freed", justify="right", style="green")
+        tgt_table.add_column("Events", justify="right", style="dim")
+
+        for target, freed in s["by_target"].items():
+            count = sum(1 for e in events if e.get("target") == target)
+            tgt_table.add_row(target, naturalsize(freed, binary=True), str(count))
+        console.print(tgt_table)
+
+    # ── Timeline ──
+    periods = summarize_by_period(events)
+
+    # Pick the right granularity based on the filter
+    if period == "today":
+        # No timeline for a single day
+        pass
+    elif period in ("week", "month"):
+        if periods["daily"]:
+            day_table = Table(title="Daily Breakdown", show_lines=False)
+            day_table.add_column("Date", style="bold")
+            day_table.add_column("Freed", justify="right", style="green")
+            day_table.add_column("Events", justify="right", style="dim")
+            day_table.add_column("", width=30)
+
+            max_freed = max(d["freed"] for d in periods["daily"]) or 1
+            for d in periods["daily"][:14]:
+                bar_len = int(d["freed"] / max_freed * 25)
+                bar = f"[green]{'█' * bar_len}[/green]{'░' * (25 - bar_len)}"
+                day_table.add_row(
+                    d["period"],
+                    naturalsize(d["freed"], binary=True),
+                    str(d["count"]),
+                    bar,
+                )
+            console.print(day_table)
+    elif period == "year":
+        if periods["monthly"]:
+            mon_table = Table(title="Monthly Breakdown", show_lines=False)
+            mon_table.add_column("Month", style="bold")
+            mon_table.add_column("Freed", justify="right", style="green")
+            mon_table.add_column("Events", justify="right", style="dim")
+            mon_table.add_column("", width=30)
+
+            max_freed = max(m["freed"] for m in periods["monthly"]) or 1
+            for m in periods["monthly"][:12]:
+                bar_len = int(m["freed"] / max_freed * 25)
+                bar = f"[green]{'█' * bar_len}[/green]{'░' * (25 - bar_len)}"
+                mon_table.add_row(
+                    m["period"],
+                    naturalsize(m["freed"], binary=True),
+                    str(m["count"]),
+                    bar,
+                )
+            console.print(mon_table)
+    else:
+        # "all" — show monthly if enough data, else daily
+        timeline = periods["monthly"] if len(periods["monthly"]) > 1 else periods["daily"]
+        label = "Monthly" if len(periods["monthly"]) > 1 else "Daily"
+        if timeline:
+            tl_table = Table(title=f"{label} Breakdown", show_lines=False)
+            tl_table.add_column("Period", style="bold")
+            tl_table.add_column("Freed", justify="right", style="green")
+            tl_table.add_column("Events", justify="right", style="dim")
+            tl_table.add_column("", width=30)
+
+            max_freed = max(t["freed"] for t in timeline) or 1
+            for t in timeline[:14]:
+                bar_len = int(t["freed"] / max_freed * 25)
+                bar = f"[green]{'█' * bar_len}[/green]{'░' * (25 - bar_len)}"
+                tl_table.add_row(
+                    t["period"],
+                    naturalsize(t["freed"], binary=True),
+                    str(t["count"]),
+                    bar,
+                )
+            console.print(tl_table)
+
+    console.print(f"\n[dim]History: {HISTORY_PATH}[/dim]")

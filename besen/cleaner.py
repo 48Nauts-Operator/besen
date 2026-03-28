@@ -56,18 +56,31 @@ def clean_targets(
     targets: list[CleanTarget],
     *,
     dry_run: bool | None = None,
+    source: str = "manual",
 ) -> int:
     """Clean multiple targets. Returns total bytes freed."""
+    from besen.history import log_clean
+
+    is_dry = dry_run if dry_run is not None else settings.dry_run
     total_freed = 0
     for target in targets:
         freed = clean_target(target, dry_run=dry_run)
         if freed > 0:
             from humanize import naturalsize
 
-            label = "[dim](dry)[/dim] " if (dry_run or settings.dry_run) else ""
+            label = "[dim](dry)[/dim] " if is_dry else ""
             console.print(
                 f"  {label}[green]✓[/green] {target.name}: "
                 f"{naturalsize(freed, binary=True)} freed"
             )
             total_freed += freed
+
+            # Log to history (skip dry runs)
+            if not is_dry:
+                log_clean(
+                    target_name=target.name,
+                    category=target.category.value,
+                    freed_bytes=freed,
+                    source=source,
+                )
     return total_freed

@@ -131,7 +131,7 @@ def apply_disk_policy(policies: Policies) -> dict:
         cleanable.sort(key=lambda t: t.size_bytes, reverse=True)
 
         if cleanable:
-            freed = clean_targets(cleanable, dry_run=False)
+            freed = clean_targets(cleanable, dry_run=False, source="daemon")
             result["cleaned"] = True
             result["freed_bytes"] = freed
             if freed > 0:
